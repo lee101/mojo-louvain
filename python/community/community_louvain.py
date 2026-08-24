@@ -53,57 +53,51 @@ def _edge_weight(data, weight):
 def _csr(graph, weight):
     nodes = list(graph)
     index = {node: i for i, node in enumerate(nodes)}
+    adjacency = graph._adj
     if graph.is_multigraph():
-        rows = [defaultdict(float) for _ in nodes]
-        edges = graph.edges(data=True, keys=True)
-        for u, v, _, data in edges:
-            w = _edge_weight(data, weight)
-            ui, vi = index[u], index[v]
-            rows[ui][vi] += w
-            if ui != vi:
-                rows[vi][ui] += w
         offsets = np.empty(len(nodes) + 1, dtype=np.int64)
         offsets[0] = 0
-        indices = []
-        values = []
+        for i, node in enumerate(nodes):
+            offsets[i + 1] = offsets[i] + len(adjacency[node])
+        indices = np.empty(int(offsets[-1]), dtype=np.int64)
+        values = np.empty(indices.size, dtype=np.float64)
         degrees = np.empty(len(nodes), dtype=np.float64)
         loops = np.zeros(len(nodes), dtype=np.float64)
-        for i, row in enumerate(rows):
-            for j, value in row.items():
-                indices.append(j)
-                values.append(value)
-                if i == j:
+        position = 0
+        for i, node in enumerate(nodes):
+            degree = 0.0
+            for neighbor, edges in adjacency[node].items():
+                value = sum(_edge_weight(data, weight) for data in edges.values())
+                indices[position] = index[neighbor]
+                values[position] = value
+                degree += value
+                if neighbor == node:
                     loops[i] = value
-            degrees[i] = sum(row.values()) + loops[i]
-            offsets[i + 1] = len(indices)
-        return nodes, offsets, np.asarray(indices, dtype=np.int64), np.asarray(values, dtype=np.float64), degrees, loops
+                position += 1
+            degrees[i] = degree + loops[i]
+        return nodes, offsets, indices, values, degrees, loops
 
-    index_rows = [[] for _ in nodes]
-    weight_rows = [[] for _ in nodes]
-    for u, v, data in graph.edges(data=True):
-        w = _edge_weight(data, weight)
-        ui, vi = index[u], index[v]
-        index_rows[ui].append(vi)
-        weight_rows[ui].append(w)
-        if ui != vi:
-            index_rows[vi].append(ui)
-            weight_rows[vi].append(w)
     offsets = np.empty(len(nodes) + 1, dtype=np.int64)
     offsets[0] = 0
-    indices = []
-    values = []
+    for i, node in enumerate(nodes):
+        offsets[i + 1] = offsets[i] + len(adjacency[node])
+    indices = np.empty(int(offsets[-1]), dtype=np.int64)
+    values = np.empty(indices.size, dtype=np.float64)
     degrees = np.empty(len(nodes), dtype=np.float64)
     loops = np.zeros(len(nodes), dtype=np.float64)
-    for i, row in enumerate(index_rows):
-        row_weights = weight_rows[i]
-        indices.extend(row)
-        values.extend(row_weights)
-        for j, value in zip(row, row_weights):
-            if i == j:
+    position = 0
+    for i, node in enumerate(nodes):
+        degree = 0.0
+        for neighbor, data in adjacency[node].items():
+            value = _edge_weight(data, weight)
+            indices[position] = index[neighbor]
+            values[position] = value
+            degree += value
+            if neighbor == node:
                 loops[i] = value
-        degrees[i] = sum(row_weights) + loops[i]
-        offsets[i + 1] = len(indices)
-    return nodes, offsets, np.asarray(indices, dtype=np.int64), np.asarray(values, dtype=np.float64), degrees, loops
+            position += 1
+        degrees[i] = degree + loops[i]
+    return nodes, offsets, indices, values, degrees, loops
 
 
 def _ffi_array(array, dtype, size, name):
@@ -118,13 +112,13 @@ def _ffi_array(array, dtype, size, name):
 def _one_level(graph, weight, resolution, random_state):
     nodes, offsets, neighbors, weights, degrees, loops = _csr(graph, weight)
     n = len(nodes)
-    communities = np.empty(n, dtype=np.int64)
-    totals = np.empty(n, dtype=np.float64)
-    internals = np.empty(n, dtype=np.float64)
-    marks = np.empty(n, dtype=np.int64)
-    candidate = np.empty(n, dtype=np.int64)
-    neigh_weights = np.empty(n, dtype=np.float64)
-    links = float(graph.size(weight=weight))
+    integer_scratch = np.empty((3, n), dtype=np.int64)
+    float_scratch = np.empty((3, n), dtype=np.float64)
+    communities, marks, candidate = integer_scratch
+    totals, internals, neigh_weights = float_scratch
+    links = float(degrees.sum()) * 0.5
+    if links == 0.0:
+        raise ZeroDivisionError("float division by zero")
     # The C ABI receives raw addresses.  Keep every array strongly referenced in
     # this frame and validate its exact dtype, shape, and layout before the call.
     offsets = _ffi_array(offsets, np.dtype(np.int64), n + 1, "offsets")
@@ -213,12 +207,7 @@ def generate_dendrogram(graph, part_init=None, weight="weight", resolution=1.0,
     state = check_random_state(random_state)
     if graph.number_of_edges() == 0:
         return [{node: i for i, node in enumerate(graph)}]
-    # A graph containing only zero-weight edges reaches a division by zero in
-    # upstream's modularity initialization.  Do not call the C kernel with
-    # uninitialized output buffers in that case.
-    if graph.size(weight=weight) == 0:
-        raise ZeroDivisionError("float division by zero")
-    current_graph = graph.copy()
+    current_graph = graph
     if part_init is None:
         status, current_modularity = _one_level(current_graph, weight, resolution, state)
     else:

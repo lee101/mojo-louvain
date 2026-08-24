@@ -69,11 +69,14 @@ dist/libmojo-louvain.so shared library
 
 Each hierarchy level is a compact CSR graph: `int64` row offsets and neighbour
 indices, with `float64` weights, degrees, self-loop weights, and community
-totals. The wrapper passes NumPy buffer addresses as `Int` values through
-ctypes. Mojo rebuilds typed mutable pointers inside the C ABI boundary and
-uses caller-owned scratch buffers for community marks and neighbour weights;
-there are no allocations or ownership transfers in the kernel. Python keeps
-the flexible node labels and constructs the induced graph between levels.
+totals. CSR arrays are preallocated NumPy buffers filled directly from the
+NetworkX adjacency maps. The wrapper passes their addresses as `Int` values
+through ctypes, without copying at the FFI boundary. Mojo rebuilds typed
+mutable pointers inside the C ABI boundary and uses caller-owned scratch
+buffers for community marks and neighbour weights; there are no allocations
+or ownership transfers in the kernel. Contiguous initialization and modularity
+reduction use float64 SIMD with scalar remainder handling. Python keeps the
+flexible node labels and constructs the induced graph between levels.
 
 ## Tests
 
@@ -95,12 +98,14 @@ the comparison uses python-louvain 0.16 on the identical NetworkX graph.
 
 | case | mojo-louvain | python-louvain | ratio | result |
 | --- | ---: | ---: | ---: | --- |
-| Louvain, 8 communities / 2,000 nodes | 191.4 ms | 636.0 ms | 3.32x | faster |
-| Louvain, 12 communities / 4,800 nodes | 593.9 ms | 1984.6 ms | 3.34x | faster |
+| Louvain, 8 communities / 2,000 nodes | 69.0 ms | 344.6 ms | 4.99x | faster |
+| Louvain, 12 communities / 4,800 nodes | 159.0 ms | 1122.3 ms | 7.06x | faster |
 
 No GPU path is included: CSR construction and the local-moving neighbour scans
 are irregular, bandwidth-bound operations with insufficient arithmetic
-intensity to recover GPU launch and transfer costs.
+intensity to recover GPU launch and transfer costs. The local-moving pass is
+also order-dependent, so it is kept serial; its independent initialization is
+too small to recover thread-launch overhead at the measured graph sizes.
 
 Reproduce the table with:
 

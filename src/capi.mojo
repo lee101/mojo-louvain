@@ -4,8 +4,12 @@ The graph is CSR: offsets[n + 1], neighbors[2m], and weights[2m].  The
 caller owns graph and scratch buffers; the kernel never allocates.
 """
 
+from std.math import iota
+from std.sys.info import simd_width_of as simdwidthof
+
 comptime I64Ptr = UnsafePointer[Int64, AnyOrigin[mut=True]]
 comptime F64Ptr = UnsafePointer[Float64, AnyOrigin[mut=True]]
+comptime W = simdwidthof[DType.float64]()
 
 
 def ip(addr: Int) -> I64Ptr:
@@ -19,12 +23,77 @@ def fp(addr: Int) -> F64Ptr:
 def modularity(internals: F64Ptr, totals: F64Ptr, n: Int, links: Float64, resolution: Float64) -> Float64:
     if links == 0.0:
         return 0.0
-    var result = 0.0
-    for c in range(n):
+    var accumulator = SIMD[DType.float64, W](0.0)
+    var zeros = SIMD[DType.float64, W](0.0)
+    var scale = 2.0 * links
+    var c = 0
+    while c + W <= n:
+        var total = totals.load[width=W, alignment=1](c)
+        var q = total / scale
+        var terms = resolution * internals.load[width=W, alignment=1](c) / links - q * q
+        accumulator += total.gt(zeros).select(terms, zeros)
+        c += W
+    var result = accumulator.reduce_add()[0]
+    while c < n:
         if totals[c] > 0.0:
             var q = totals[c] / (2.0 * links)
             result += resolution * internals[c] / links - q * q
+        c += 1
     return result
+
+
+def initialize_range(
+    degrees: F64Ptr,
+    loops: F64Ptr,
+    communities: I64Ptr,
+    totals: F64Ptr,
+    internals: F64Ptr,
+    marks: I64Ptr,
+    start: Int,
+    stop: Int,
+):
+    var i = start
+    var empty_marks = SIMD[DType.int64, W](-1)
+    while i + W <= stop:
+        communities.store[alignment=1](i, iota[DType.int64, W](Int64(i)))
+        totals.store[alignment=1](i, degrees.load[width=W, alignment=1](i))
+        internals.store[alignment=1](i, loops.load[width=W, alignment=1](i))
+        marks.store[alignment=1](i, empty_marks)
+        i += W
+    while i < stop:
+        communities[i] = Int64(i)
+        totals[i] = degrees[i]
+        internals[i] = loops[i]
+        marks[i] = -1
+        i += 1
+
+
+def initialize_state(
+    degrees: F64Ptr,
+    loops: F64Ptr,
+    communities: I64Ptr,
+    totals: F64Ptr,
+    internals: F64Ptr,
+    marks: I64Ptr,
+    n: Int,
+):
+    initialize_range(degrees, loops, communities, totals, internals, marks, 0, n)
+
+
+@export("mlj_initialize")
+def mlj_initialize(
+    degrees_addr: Int,
+    loops_addr: Int,
+    communities_addr: Int,
+    totals_addr: Int,
+    internals_addr: Int,
+    marks_addr: Int,
+    n: Int,
+) abi("C"):
+    initialize_state(
+        fp(degrees_addr), fp(loops_addr), ip(communities_addr),
+        fp(totals_addr), fp(internals_addr), ip(marks_addr), n,
+    )
 
 
 def next_random(state: UInt64) -> UInt64:
@@ -66,11 +135,7 @@ def mlj_one_level(
     var candidates = ip(candidate_addr)
     var neigh_weights = fp(neigh_weights_addr)
 
-    for i in range(n):
-        communities[i] = Int64(i)
-        totals[i] = degrees[i]
-        internals[i] = loops[i]
-        marks[i] = -1
+    initialize_state(degrees, loops, communities, totals, internals, marks, n)
 
     var old_modularity = modularity(internals, totals, n, links, resolution)
     var state = UInt64(seed) + 1442695040888963407

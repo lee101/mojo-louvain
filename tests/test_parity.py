@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import array
+import ctypes
 import importlib.util
 import inspect
 import sys
@@ -86,6 +87,20 @@ def test_simple_graph_csr_uses_contiguous_adjacency_rows():
     assert np.array_equal(loops, [5.0, 0.0, 0.0])
 
 
+def test_multigraph_csr_aggregates_edges_in_preallocated_rows():
+    graph = nx.MultiGraph()
+    graph.add_edge("a", "b", weight=2.0)
+    graph.add_edge("a", "b", weight=3.0)
+    graph.add_edge("a", "a", weight=4.0)
+    nodes, offsets, neighbors, weights, degrees, loops = _csr(graph, "weight")
+    assert nodes == ["a", "b"]
+    assert np.array_equal(offsets, [0, 2, 3])
+    assert np.array_equal(neighbors, [1, 0, 0])
+    assert np.array_equal(weights, [5.0, 4.0, 5.0])
+    assert np.array_equal(degrees, [13.0, 5.0])
+    assert np.array_equal(loops, [4.0, 0.0])
+
+
 def test_karate_quality_is_near_upstream():
     graph = nx.karate_club_graph()
     ours = community.best_partition(graph, random_state=0)
@@ -164,3 +179,25 @@ def test_ffi_buffer_contract_rejects_wrong_dtype_shape_and_layout():
         _ffi_array(np.zeros(3, dtype=np.float32), np.dtype(np.float64), 3, "values")
     with pytest.raises(RuntimeError, match="invalid values"):
         _ffi_array(np.zeros(4, dtype=np.float64)[::2], np.dtype(np.float64), 2, "values")
+
+
+def test_native_initialization_simd_tail():
+    size = 13
+    native = community.community_louvain.lib()
+    initialize = native.mlj_initialize
+    initialize.argtypes = [ctypes.c_int64] * 7
+    initialize.restype = None
+    degrees = np.arange(size, dtype=np.float64) + 0.25
+    loops = np.arange(size, dtype=np.float64) * 0.5
+    communities = np.empty(size, dtype=np.int64)
+    totals = np.empty(size, dtype=np.float64)
+    internals = np.empty(size, dtype=np.float64)
+    marks = np.empty(size, dtype=np.int64)
+    initialize(
+        degrees.ctypes.data, loops.ctypes.data, communities.ctypes.data,
+        totals.ctypes.data, internals.ctypes.data, marks.ctypes.data, size,
+    )
+    assert np.array_equal(communities, np.arange(size, dtype=np.int64))
+    assert np.array_equal(totals, degrees)
+    assert np.array_equal(internals, loops)
+    assert np.all(marks == -1)
